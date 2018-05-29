@@ -324,45 +324,6 @@ bool promotionImprovesCoalescing(
 }
 
 /*
- * Check if the given "group" can be promoted to registers for the given
- * mapping to thread identifiers and within the given outer schedule.
- *
- * In particular, the group's footprint must contain only one element and the
- * same tensor element should never be accessed by two different threads
- * within the same iteration of the outer schedule.
- * The second test is performed by checking that there is only a single
- * thread associated to a given pair of tensor element and outer schedule
- * iteration.
- * Note that the test for a single thread is performed by looking
- * at the range of "thread".  This range may be larger than the number
- * of threads, such that multiple instances may get mapped to the same thread.
- * Requiring different such instances is therefore slightly more conservative
- * than strictly needed.
- */
-bool isPromotableToRegisterBelowThreads(
-    const TensorReferenceGroup& group,
-    isl::multi_union_pw_aff outer,
-    isl::multi_union_pw_aff thread) {
-  auto originalAccesses = group.originalAccesses();
-
-  // Return early if more than one element needs to be stored in registers.
-  // TODO: support arrays in registers if they are only accessed with constant
-  // subscripts, e.g. if the inner loops are fully unrolled.
-  auto sizes = group.approximationSizes();
-  auto nElements =
-      std::accumulate(sizes.begin(), sizes.end(), 1, std::multiplies<size_t>());
-  if (nElements != 1) {
-    return false;
-  }
-
-  auto map = isl::union_map::from(outer);
-  map = map.range_product(group.originalAccesses());
-  map = map.apply_domain(isl::union_map::from(thread));
-
-  return map.is_injective();
-}
-
-/*
  * Starting from the root, find bands where depth is reached.  Using
  * DFSPreorder to make sure order is specified and consistent for tests.
  */
@@ -543,6 +504,160 @@ isl::union_set collectMappingsTo(const Scop& scop) {
   }
   return domain;
 }
+
+/*
+ * Check that accesses described by "group" are thread-private within the given
+ * scope, i.e. that no two threads access the same tensor element.  The scope
+ * is defined by "prefixSchedule" that describes the outer loops.  Within
+ * different instances of "prefixSchedule", threads may access the same
+ * element.  It is expected to be copied to registers at the beginning of the
+ * scope, and back to some location accessible to all threads at the end of the
+ * scope.  If synchronization is necessary due to data dependences, it should
+ * have been inserted by the mapping at the end of the scope.
+ */
+bool isThreadPrivate(
+    const TensorReferenceGroup& group,
+    isl::multi_union_pw_aff prefixSchedule,
+    isl::multi_union_pw_aff threadSchedule) {
+  auto accesses = group.originalAccesses(); // D -> A
+  auto prefixScheduleUmap = isl::union_map::from(prefixSchedule); // D -> Sp
+  auto accessesWithinScope =
+      accesses.range_product(prefixScheduleUmap); // D -> (Sp -> A)
+  auto threadScheduleUmap = isl::union_map::from(threadSchedule); // D -> St
+  auto threadAccesses =
+      accessesWithinScope.apply_domain(threadScheduleUmap); // T -> (Sp -> A)
+  return threadAccesses.is_injective();
+}
+
+/*
+ * Check if the band was mapped to threads.
+ * We currently map entire bands to threads and insert a thread-specific marker
+ * immediately after such bands.
+ */
+inline bool isThreadMappedBand(const detail::ScheduleTree* tree) {
+  return matchOne(band(threadSpecific(any())), tree);
+}
+
+/*
+ * Check that only unrolled loops may appear in access subscripts.
+ * Because the scoping point can be above a branching tree, descend into each
+ * leaf of the subtree below the scoping point.  For each leaf, construct an
+ * affine multi-expression containing only those band members between the
+ * scoping point and the leaf that are fully unrolled.  If band members are
+ * mapped to threads, do not take into account the parts that will appear in
+ * subscripts as thread identifiers, i.e. subtract the mapped affine functions
+ * from the schedule affine functions.
+ *
+ * Within each instance of the scope, check that loops that are either unrolled
+ * or mapped to threads access a single tensor element in the group (other loop
+ * indices will then not appear in the subscripts, making register promotion
+ * possible).  In other words, check that the relation between the flat product
+ * of prefix, thread-mapped, and unrolled loop indices and accessed elements is
+ * single-valued.
+ * TODO: note that if a group is formed from partially overlapping references,
+ * one must consider per-reference access relation for single-valuedness as
+ * different references may have different values, but all of them remain
+ * independent of non-unrolled loop iterators.
+ */
+bool accessSubscriptsAreUnrolledLoops(
+    const TensorReferenceGroup& group,
+    const detail::ScheduleTree* root,
+    const detail::ScheduleTree* scope,
+    isl::multi_union_pw_aff threadSchedule) {
+  using namespace detail;
+
+  auto prefixSchedule = partialScheduleMupa(root, scope);
+
+  auto nodes = ScheduleTree::collect(scope);
+  auto leaves = functional::Filter(
+      [](const ScheduleTree* tree) { return tree->numChildren() == 0; }, nodes);
+
+  auto domainNode = root->elemAs<detail::ScheduleTreeElemDomain>();
+  CHECK(domainNode);
+  auto domain = domainNode->domain_;
+
+  // Descend into every leaf.
+  for (auto leaf : leaves) {
+    auto ancestors = leaf->ancestors(root);
+    ancestors.push_back(leaf);
+    auto subdomain = activeDomainPointsBelow(root, leaf);
+
+    auto unrolledDims = isl::union_pw_aff_list(leaf->ctx_, 1);
+    for (auto node : ancestors) {
+      auto band = node->elemAs<detail::ScheduleTreeElemBand>();
+      if (!band) {
+        continue;
+      }
+
+      isl::multi_union_pw_aff schedule = band->mupa_;
+      if (isThreadMappedBand(node)) {
+        // Band members are mapped to threads in inverse order.  There may be
+        // less members than thread dimensions (the remaining thread dimensions
+        // are mapped to 0).  Transform the thread schedule accordingly before
+        // subtracting it from the band schedule.
+        auto bandCompatibleThreadSchedule =
+            isl::union_pw_aff_list(schedule.get_ctx(), band->nMember());
+        auto threadScheduleDims =
+            threadSchedule.get_union_pw_aff_list().reverse();
+        CHECK_LE(band->nMember(), static_cast<size_t>(threadScheduleDims.n()));
+        for (int i = 0; i < band->nMember(); ++i) {
+          bandCompatibleThreadSchedule =
+              bandCompatibleThreadSchedule.add(threadScheduleDims.get(i));
+        }
+
+        schedule = schedule.sub(isl::multi_union_pw_aff(
+            schedule.get_space(), bandCompatibleThreadSchedule));
+      }
+      schedule = schedule.intersect_domain(subdomain);
+
+      for (size_t i = 0, e = band->nMember(); i < e; ++i) {
+        if (!band->unroll_[i]) {
+          continue;
+        }
+        unrolledDims = unrolledDims.add(schedule.get_union_pw_aff(i));
+      }
+    }
+
+    auto space = isl::space(leaf->ctx_, 0, unrolledDims.n())
+                     .align_params(subdomain.get_space());
+    auto unrolledDimsMupa = isl::multi_union_pw_aff(space, unrolledDims);
+
+    // It is possible that no loops are unrolled, in which case
+    // unrolledDimsMupa is zero-dimensional and needs an explicit domain
+    // to be convertible to a union_map.
+    unrolledDimsMupa =
+        unrolledDimsMupa.intersect_domain(group.originalAccesses().domain());
+
+    auto accesses = group.originalAccesses();
+    auto schedule = prefixSchedule.flat_range_product(threadSchedule)
+                        .flat_range_product(unrolledDimsMupa);
+    accesses = accesses.apply_domain(isl::union_map::from(schedule));
+
+    if (!accesses.is_single_valued()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/*
+ * Check if the tensor reference group "group" can be promoted to registers at
+ * the given "scope" in the schedule tree of "scop".
+ * In particular, check that no elements in this group are accessed by
+ * different threads and that all loop indices that may appear in subscripts
+ * correspond to unrolled loops.
+ */
+bool isPromotableToRegistersBelow(
+    const TensorReferenceGroup& group,
+    const MappedScop& scop,
+    const detail::ScheduleTree* scope) {
+  auto prefixSchedule = partialScheduleMupa(scop.schedule(), scope);
+  auto threadSchedule = scop.threadMappingSchedule(scop.schedule());
+  return isThreadPrivate(group, prefixSchedule, threadSchedule) &&
+      accessSubscriptsAreUnrolledLoops(
+             group, scop.schedule(), scope, threadSchedule);
+}
 } // namespace
 
 void promoteGreedilyAtDepth(
@@ -558,59 +673,69 @@ void promoteGreedilyAtDepth(
   mapCopiesToThreads(mscop, unrollCopies);
 }
 
+void promoteToRegistersBelow(MappedScop& mscop, detail::ScheduleTree* scope) {
+  auto& scop = mscop.scop();
+
+  // Compute groups specific to threads and block by including the mappings
+  // into the domain of the partials schedule.
+  auto mapping = collectMappingsTo<mapping::ThreadId>(scop).intersect(
+      collectMappingsTo<mapping::BlockId>(scop));
+  auto schedule = partialSchedule(scop.scheduleRoot(), scope);
+  auto groupMap = TensorReferenceGroup::accessedWithin(
+      schedule.intersect_domain(mapping), scop.reads, scop.writes);
+
+  // FIXME: this schedule is also computed in
+  // isPromotableToRegistersBelow
+  auto threadSchedule = mscop.threadMappingSchedule(mscop.schedule());
+
+  for (auto& tensorGroups : groupMap) {
+    auto tensorId = tensorGroups.first;
+
+    // TODO: sort using heuristic and count the total number of registers
+
+    // FIXME: this schedule is also computed in
+    // isPromotableToRegistersBelow
+    auto partialSched = partialScheduleMupa(scop.scheduleRoot(), scope);
+    auto partialSchedUM = partialSchedule(scop.scheduleRoot(), scope);
+
+    for (auto& group : tensorGroups.second) {
+      auto sizes = group->approximationSizes();
+      // No point in promoting a scalar that will go to a register anyway.
+      if (sizes.size() == 0) {
+        continue;
+      }
+      if (!isPromotableToRegistersBelow(*group, mscop, scope)) {
+        continue;
+      }
+      // Check reuse within threads.
+      auto schedule = partialSched.flat_range_product(threadSchedule);
+      if (!hasReuseWithin(*group, schedule)) {
+        continue;
+      }
+
+      // TODO: if something is already in shared, but reuse it within one
+      // thread only, there is no point in keeping it in shared _if_ it
+      // gets promoted into a register.
+
+      scop.promoteGroup(
+          Scop::PromotedDecl::Kind::Register,
+          tensorId,
+          std::move(group),
+          scope,
+          partialSchedUM);
+    }
+  }
+}
+
 // Promote at the positions of the thread specific markers.
-void promoteToRegistersBelowThreads(Scop& scop, size_t nRegisters) {
+void promoteToRegistersBelowThreads(MappedScop& mscop, size_t nRegisters) {
   using namespace tc::polyhedral::detail;
 
-  auto root = scop.scheduleRoot();
+  auto root = mscop.scop().scheduleRoot();
+  auto markers = findThreadSpecificMarkers(root);
 
-  {
-    auto markers = findThreadSpecificMarkers(root);
-
-    for (auto marker : markers) {
-      auto partialSched = prefixSchedule(root, marker);
-      // Pure affine schedule without (mapping) filters.
-      auto mapping = findThreadMappingAncestor(root, marker);
-      auto prefixSchedMupa = prefixScheduleMupa(root, mapping);
-      auto mapSchedMupa = infixScheduleMupa(root, mapping, marker);
-      auto partialSchedMupa = prefixSchedMupa.flat_range_product(mapSchedMupa);
-
-      // Because this function is called below the thread mapping marker,
-      // partialSched has been intersected with both the block and the thread
-      // mapping filters.   Therefore, groups will be computed relative to
-      // blocks and threads.
-      auto groupMap = TensorReferenceGroup::accessedWithin(
-          partialSched, scop.reads, scop.writes);
-      for (auto& tensorGroups : groupMap) {
-        auto tensorId = tensorGroups.first;
-
-        // TODO: sorting of groups and counting the number of promoted elements
-
-        for (auto& group : tensorGroups.second) {
-          auto sizes = group->approximationSizes();
-          // No point in promoting a scalar that will go to a register anyway.
-          if (sizes.size() == 0) {
-            continue;
-          }
-          if (!isPromotableToRegisterBelowThreads(
-                  *group, prefixSchedMupa, mapSchedMupa)) {
-            continue;
-          }
-          if (!hasReuseWithin(*group, partialSchedMupa)) {
-            continue;
-          }
-          // TODO: if something is already in shared, but reuse it within one
-          // thread only, there is no point in keeping it in shared _if_ it
-          // gets promoted into a register.
-          scop.promoteGroup(
-              Scop::PromotedDecl::Kind::Register,
-              tensorId,
-              std::move(group),
-              marker,
-              partialSched);
-        }
-      }
-    }
+  for (auto marker : markers) {
+    promoteToRegistersBelow(mscop, marker);
   }
 }
 
