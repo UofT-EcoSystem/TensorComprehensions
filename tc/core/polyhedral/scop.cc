@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "tc/core/check.h"
 #include "tc/core/halide2isl.h"
 #include "tc/core/polyhedral/functional.h"
 #include "tc/core/polyhedral/memory_promotion.h"
@@ -43,7 +44,7 @@ using ScopUPtr = std::unique_ptr<Scop>;
 ScopUPtr Scop::makeScop(
     isl::ctx ctx,
     const tc2halide::HalideComponents& components) {
-  CHECK(components.stmt.defined());
+  TC_CHECK(components.stmt.defined());
 
   halide2isl::SymbolTable sym = halide2isl::makeSymbolTable(components);
 
@@ -80,14 +81,14 @@ ScopUPtr Scop::makeScop(isl::ctx ctx, const lang::TreeRef& treeRef) {
 
 isl::union_set& Scop::domain() {
   auto dom = scheduleRoot()->elemAs<ScheduleTreeElemDomain>();
-  CHECK(dom) << "root is not a domain in: " << *scheduleRoot();
+  TC_CHECK(dom) << "root is not a domain in: " << *scheduleRoot();
   // TODO: activate this when the invariant has a chance of working (i.e. we
   // don't use a Context node for specifying parameter values that iterate in
   // spacetime).
   // TODO: find a proper place for the invariant.
   // auto noCont =
   //   scheduleRoot()->child({0})->elemAs<ScheduleTreeElemContext>();
-  // CHECK(!noCont) << "root is not a domain in: " << *scheduleRoot();
+  // TC_CHECK(!noCont) << "root is not a domain in: " << *scheduleRoot();
   return dom->domain_;
 }
 
@@ -141,7 +142,7 @@ void checkFiltersDisjointStatements(const ScheduleTree* root) {
     isl::union_set alreadyVisitedStmts;
     for (auto child : node->children()) {
       auto filterNode = child->elemAsBase<ScheduleTreeElemFilter>();
-      CHECK(filterNode) << "expected children of seqence to be filters";
+      TC_CHECK(filterNode) << "expected children of seqence to be filters";
       auto filter = filterNode->filter_.universe();
       if (!alreadyVisitedStmts.get()) {
         alreadyVisitedStmts = filter;
@@ -151,7 +152,7 @@ void checkFiltersDisjointStatements(const ScheduleTree* root) {
         // but only to a part of it.  Possible solution -- introduce "scope"
         // mark nodes into the schedule tree that will contain information
         // about the promotion and process these marks when generating the AST.
-        CHECK(alreadyVisitedStmts.intersect(filter).is_empty())
+        TC_CHECK(alreadyVisitedStmts.intersect(filter).is_empty())
             << "filters are expected to be disjoint as stmt level";
         alreadyVisitedStmts = alreadyVisitedStmts.unite(filter);
       }
@@ -209,7 +210,7 @@ void Scop::insertSyncsAroundCopies(ScheduleTree* tree) {
 
   // Insert syncs before and after copies (FIXME: this is excessive)
   auto seqNode = tree->child({0, 0});
-  CHECK(seqNode->elemAs<detail::ScheduleTreeElemSequence>())
+  TC_CHECK(seqNode->elemAs<detail::ScheduleTreeElemSequence>())
       << "unexpected tree structure";
 
   int foundMainComputations = 0;
@@ -217,7 +218,7 @@ void Scop::insertSyncsAroundCopies(ScheduleTree* tree) {
   for (size_t i = 0; i < seqNode->numChildren(); ++i) {
     auto filterNode =
         seqNode->child({i})->elemAs<detail::ScheduleTreeElemFilter>();
-    CHECK(filterNode) << "expected filters below sequence";
+    TC_CHECK(filterNode) << "expected filters below sequence";
     auto filters = isl::UnionAsVector<isl::union_set>(filterNode->filter_);
     bool isCopyFilter = filters.size() == 1 && filters[0].has_tuple_name() &&
         (filters[0].get_tuple_name() == kReadIdName ||
@@ -229,7 +230,7 @@ void Scop::insertSyncsAroundCopies(ScheduleTree* tree) {
     if (!isCopyFilter) {
       ++foundMainComputations;
     }
-    CHECK_LT(foundMainComputations, 2)
+    TC_CHECK_LT(foundMainComputations, 2)
         << "copies are interleaved with computation" << *seqNode;
     if (filters[0].get_tuple_name() != lastTupleName) {
       lastTupleName = filters[0].get_tuple_name();
@@ -270,12 +271,12 @@ void Scop::promoteEverythingAt(std::vector<size_t> pos) {
 // TODO(ntv)
 isl::set Scop::makeContextFromInputs(
     const std::vector<const DLConstTensor*>& inputs) const {
-  CHECK_EQ(halide.inputs.size(), inputs.size());
+  TC_CHECK_EQ(halide.inputs.size(), inputs.size());
 
   auto paramSpace = domain().get_space().params();
   auto paramSet = isl::set::universe(paramSpace);
   for (size_t i = 0, ei = inputs.size(); i < ei; ++i) {
-    CHECK_EQ(halide.inputs[i].dimensions(), inputs[i]->ndim);
+    TC_CHECK_EQ(halide.inputs[i].dimensions(), inputs[i]->ndim);
     for (size_t j = 0, ej = halide.inputs[i].dimensions(); j < ej; ++j) {
       auto parametricAff = halide2isl::makeIslAffFromExpr(
           paramSpace, halide.inputs[i].parameter().extent_constraint(j));
@@ -283,7 +284,7 @@ isl::set Scop::makeContextFromInputs(
           paramSet & (isl::aff_set(parametricAff) == inputs[i]->shape[j]);
     }
   }
-  CHECK(paramSet.is_equal(paramSet.sample()))
+  TC_CHECK(paramSet.is_equal(paramSet.sample()))
       << "could not infer the values of parameters";
   return paramSet;
 }
@@ -293,7 +294,7 @@ std::vector<long> Scop::getParameterValues(isl::set context) const {
   auto longMax = isl::val(ctx, std::numeric_limits<long>::max());
   auto space = context.get_space();
   auto p = context.sample_point();
-  CHECK(context.is_equal(p));
+  TC_CHECK(context.is_equal(p));
 
   // Scop holds a vector of Variables.
   // Iterate over parameters in order, checking if the
@@ -302,10 +303,10 @@ std::vector<long> Scop::getParameterValues(isl::set context) const {
   std::vector<long> paramValues;
   for (auto const& param : halide.params) {
     isl::id id(ctx, param.name());
-    CHECK(context.involves_param(id));
+    TC_CHECK(context.involves_param(id));
     auto val = isl::aff::param_on_domain_space(space, id).eval(p);
-    CHECK(val.is_int()) << "fractional parameters unsupported";
-    CHECK(val.le(longMax)) << "parameter value overflows long";
+    TC_CHECK(val.is_int()) << "fractional parameters unsupported";
+    TC_CHECK(val.le(longMax)) << "parameter value overflows long";
     paramValues.push_back(val.get_num_si());
   }
   return paramValues;
@@ -445,7 +446,7 @@ namespace {
  */
 detail::ScheduleTree* setPermutable(detail::ScheduleTree* tree) {
   auto band = tree->elemAs<detail::ScheduleTreeElemBand>();
-  CHECK(band);
+  TC_CHECK(band);
   band->permutable_ = true;
   return tree;
 }
@@ -526,7 +527,7 @@ const Halide::OutputImageParam& Scop::findArgument(isl::id id) const {
     }
   }
 
-  CHECK(false) << "name \"" << name << "\" not found";
+  TC_CHECK(false) << "name \"" << name << "\" not found";
   return *halide.inputs.begin();
 }
 

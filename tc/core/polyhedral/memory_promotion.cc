@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "tc/core/check.h"
 #include "tc/core/polyhedral/exceptions.h"
 #include "tc/core/polyhedral/schedule_tree.h"
 #include "tc/core/polyhedral/scop.h"
@@ -56,7 +57,7 @@ std::pair<isl::val, isl::aff> outputRange(
 }
 
 std::pair<isl::val, isl::aff> outputRangeSingle(isl::map access) {
-  CHECK_EQ(access.dim(isl::dim_type::out), 1u)
+  TC_CHECK_EQ(access.dim(isl::dim_type::out), 1u)
       << "expected 1-dim output, call outputRanges instead";
   access = access.detect_equalities();
   auto wrappedAccess = access.wrap().flatten().compute_divs().simple_hull();
