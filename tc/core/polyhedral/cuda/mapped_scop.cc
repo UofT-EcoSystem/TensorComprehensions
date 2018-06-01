@@ -506,7 +506,10 @@ isl::multi_union_pw_aff MappedScop::threadMappingSchedule(
     ids.emplace_back(mapping::ThreadId::makeId(i));
   }
   auto tupleId = isl::id(tree->ctx_, kBlock);
-  return extractDomainToIds(tree, ids, tupleId);
+  auto mapping = extractDomainToIds(tree, ids, tupleId);
+  // Check that all active elements got mapped.
+  CHECK(activeDomainPoints(schedule(), tree).is_subset(mapping.domain()));
+  return mapping;
 }
 
 Scop::SyncLevel MappedScop::findBestSync(
