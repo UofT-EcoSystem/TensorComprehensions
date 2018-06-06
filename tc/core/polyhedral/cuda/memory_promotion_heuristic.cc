@@ -526,6 +526,21 @@ void promoteToSharedGreedy(
     scop.insertSyncsAroundCopies(bandNode);
   }
 }
+
+// Returns a union of all mapping filters to "MappingType" in "scop".
+template <typename MappingType>
+isl::union_set collectMappingsTo(const Scop& scop) {
+  auto root = scop.scheduleRoot();
+  auto domain = scop.domain();
+  auto mappingFilters = detail::ScheduleTree::collect(
+      root, detail::ScheduleTreeType::MappingFilter);
+  mappingFilters = functional::Filter(isMappingTo<MappingType>, mappingFilters);
+  for (auto mf : mappingFilters) {
+    auto filterNode = mf->elemAs<detail::ScheduleTreeElemMappingFilter>();
+    domain = domain.intersect(filterNode->filter_);
+  }
+  return domain;
+}
 } // namespace
 
 void promoteGreedilyAtDepth(
