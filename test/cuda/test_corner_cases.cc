@@ -320,6 +320,29 @@ i))
       at::Scalar(d[0]).toFloat());
 }
 
+// Passing a tensor of mismatching dimension should fail.
+TEST(TestCornerCases, E25) {
+  auto a = F(1);
+  auto b = F(1, 1); // 2D-tensor
+  Fail(
+      "expected 1 dimensions but found tensor with 2 dimensions",
+      "def f(float(1) a) -> (b) { b(i) = a(i) }",
+      {a},
+      {b});
+}
+
+TEST(TestCornerCases, E26) {
+  auto a = I();
+  auto b = I();
+  auto r = I(1);
+  Succeed(
+      "def f(int32 a, int32 b) -> (c) { c(i) = int32(a % b) where i in 0:1 }",
+      {a, b},
+      {r});
+  auto e = at::Scalar(a).toInt() % at::Scalar(b).toInt();
+  CHECK_EQ(at::Scalar(r[0]).toInt(), e);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   ::gflags::ParseCommandLineFlags(&argc, &argv, true);

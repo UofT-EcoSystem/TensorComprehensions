@@ -1090,8 +1090,9 @@ def fun(float(N) I) -> (O) {
 )TC";
   auto mappingOptions = DefaultOptions().useReadOnlyCache(true);
   auto code = codegenMapped(tc, mappingOptions);
-  ASSERT_TRUE(code.find("__ldg(&O") == std::string::npos) << code; // no
-  ASSERT_TRUE(code.find("__ldg(&I") != std::string::npos) << code; // yes
+  using tc::code::cuda::kLdg;
+  ASSERT_TRUE(code.find(kLdg + "(&O") == std::string::npos) << code; // no
+  ASSERT_TRUE(code.find(kLdg + "(&I") != std::string::npos) << code; // yes
 }
 
 /*
@@ -1115,6 +1116,39 @@ TEST_F(PolyhedralMapperTest, EmptyMappingFilter) {
   auto mscop = MappedScop::makeWithOuterBlockInnerThreadStrategy(
       std::move(scop), mappingOptions);
   mscop->codegen(specializedName);
+}
+
+TEST_F(PolyhedralMapperTest, ModulusConstantRHS) {
+  string tc = R"TC(
+def fun(float(N) a) -> (b) { b(i) = a(i % 3) where i in 0:N }
+)TC";
+  // This triggers tc2halide conversion and should not throw.
+  auto scop = Prepare(tc);
+  for (auto r : scop->reads.wrap().get_set_list()) {
+    auto read = r.unwrap();
+    // skip irrelevant reads, if any
+    if (read.range().get_tuple_name() != std::string("a")) {
+      continue;
+    }
+    EXPECT_EQ(r.get_stride(0), 3);
+  }
+}
+
+TEST_F(PolyhedralMapperTest, ModulusVariableRHS) {
+  string tc = R"TC(
+def local_sparse_convolution(float(N, C, H, W) I, float(O, KC, KH, KW) W1) -> (O1) {
+  O1(n, o, h, w) +=! I(n, kc % c, h + kh, w + kw) * W1(o, kc, kh, kw) where c in 1:C
+}
+)TC";
+  // This triggers tc2halide conversion and should not throw.
+  auto scop = Prepare(tc);
+  for (auto r : scop->reads.range().get_set_list()) {
+    // skip irrelevant reads, if any
+    if (r.get_tuple_name() != std::string("I")) {
+      continue;
+    }
+    EXPECT_TRUE(r.plain_is_universe());
+  }
 }
 
 int main(int argc, char** argv) {
