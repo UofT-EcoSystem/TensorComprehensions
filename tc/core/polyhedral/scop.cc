@@ -141,8 +141,8 @@ void checkFiltersDisjointStatements(const ScheduleTree* root) {
        ScheduleTree::collect(root, detail::ScheduleTreeType::Sequence)) {
     isl::union_set alreadyVisitedStmts;
     for (auto child : node->children()) {
-      auto filterNode = child->elemAsBase<ScheduleTreeElemFilter>();
-      TC_CHECK(filterNode) << "expected children of seqence to be filters";
+      auto filterNode = child->elemAs<ScheduleTreeElemFilter>();
+      TC_CHECK(filterNode) << "expected children of sequence to be filters";
       auto filter = filterNode->filter_.universe();
       if (!alreadyVisitedStmts.get()) {
         alreadyVisitedStmts = filter;
@@ -192,7 +192,13 @@ void Scop::promoteGroup(
     sizes.back() += 1;
   }
   promotedDecls_[groupId] = PromotedDecl{tensorId, sizes, kind};
-  insertCopiesUnder(*this, tree, *gr, tensorId, groupId);
+  insertCopiesUnder(
+      *this,
+      tree,
+      *gr,
+      tensorId,
+      groupId,
+      kind == PromotedDecl::Kind::Register);
 
   // FIXME: we can now store a unique pointer...
   auto group = std::shared_ptr<TensorReferenceGroup>(std::move(gr));
@@ -249,7 +255,7 @@ void Scop::promoteEverythingAt(std::vector<size_t> pos) {
   checkFiltersDisjointStatements(scheduleRoot());
   auto schedule = partialSchedule(root, tree);
 
-  auto groupMap = TensorReferenceGroup::accessedBySubtree(tree, *this);
+  auto groupMap = TensorReferenceGroup::accessedWithin(schedule, reads, writes);
   for (auto& p : groupMap) {
     for (auto& gr : p.second) {
       promoteGroup(
