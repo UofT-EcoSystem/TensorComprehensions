@@ -25,8 +25,8 @@
 #include <gtest/gtest.h>
 
 #include "tc/core/constants.h"
+#include "tc/core/cuda/cuda_libraries.h"
 #include "tc/core/cuda/cuda_mapping_options.h"
-#include "tc/core/libraries.h"
 #include "tc/core/polyhedral/cuda/codegen.h"
 #include "tc/core/polyhedral/cuda/mapped_scop.h"
 #include "tc/core/polyhedral/functional.h"
@@ -1149,6 +1149,21 @@ def local_sparse_convolution(float(N, C, H, W) I, float(O, KC, KH, KW) W1) -> (O
     }
     EXPECT_TRUE(r.plain_is_universe());
   }
+}
+
+/*
+ * Check that a TC with a single instance gets mapped properly.
+ * tightenLaunchBounds (called during codegen) will complain
+ * if it is not.
+ */
+TEST_F(PolyhedralMapperTest, SingleInstance) {
+  string tc = R"TC(
+def f(float(N) I) -> (a)
+{
+    a = 0
+}
+)TC";
+  codegenMapped(tc, DefaultOptions());
 }
 
 int main(int argc, char** argv) {
