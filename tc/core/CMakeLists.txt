@@ -21,6 +21,7 @@ add_library(
   halide2isl.cc
   halide_utils.cc
 
+  polyhedral/body.cc
   polyhedral/codegen.cc
   polyhedral/memory_promotion.cc
   polyhedral/reduction_matcher.cc
@@ -29,6 +30,7 @@ add_library(
   polyhedral/schedule_tree.cc
   polyhedral/schedule_tree_elem.cc
   polyhedral/schedule_print.cc
+  polyhedral/schedule_utils.cc
   polyhedral/scop.cc
   polyhedral/separation.cc
   polyhedral/unroll.cc
